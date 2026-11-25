@@ -1,20 +1,26 @@
 """
 Continue.dev LangGraph Proxy — Workflow AI Ollama (v0.5.0)
-Arquitetura Dual-Model com Duas Ferramentas (`tavily_web_search` + `sandbox_file_manager`):
-- Helper LLM (`liquid/lfm2.5-1.2b` / `lfm2.5-helper`): Sumarização de Memória de Curto Prazo
-  via `.invoke()` direto com prompt isolado (sem Pydantic e sem SystemMessage em runtime).
-- Main LLM (`qwen/qwen3-1.7b` / `qwen3-main`): Agente de ferramentas via `@tool(return_direct=True)`
-  + `create_agent` (`tavily_web_search` e `sandbox_file_manager`) e geração da resposta final
-  via `.astream()` / `.ainvoke()` livre, com retorno integral do arquivo no ToolMessage.
+Arquitetura Dual-Model com Multi-Tool Chaining (`return_direct=False` + Append por `msg.name`)
+e Sumarização Técnica Detalhada no Helper (`LFM2.5-1.2B`):
+- Helper LLM (`liquid/lfm2.5-1.2b` / `lfm2.5-helper`): Sumarização incremental detalhada em 4 dimensões
+  (Tópico/Objetivo, Código/Arquivos Desenvolvidos, Stack/Decisões/Restrições e Estado Atual para turnos futuros)
+  via `.invoke()` direto com janela de leitura ampliada (`[:1800]` chars por mensagem).
+- Main LLM (`qwen/qwen3-1.7b` / `qwen3-main`):
+  1. Ciclo Multi-Tool no `create_agent` (`return_direct=False`, `recursion_limit=6`): o agente pode
+     chamar uma tool (`tavily_web_search`), receber e avaliar seu `ToolMessage`, encadear outra tool
+     (`sandbox_file_manager`) se necessário, e anexar todos os resultados diferenciados por `msg.name`.
+  2. Validação AST (`ast.parse`) no `write_file` + síntese limpa via `.invoke()` (aproveitando docs já
+     buscados pelo Tavily no mesmo turno) e modo de explicação sem repetir o código inteiro no chat.
 """
 
+import ast
 import os
 import re
 import json
 import time
 import uuid
 from pathlib import Path
-from typing import List, Literal, TypedDict, Optional, Any
+from typing import Dict, List, Literal, Set, TypedDict, Optional, Any
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -48,7 +54,7 @@ MAIN_MODEL_NAME = os.environ.get("MAIN_MODEL_NAME")
 # TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY")
 TAVILY_API_KEY = ""
 
-app = FastAPI(title="Continue.dev LangGraph Proxy", version="0.5.0")
+app = FastAPI(title="Symphonic AI Orquestrator", version="0.5.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -80,8 +86,16 @@ SESSION_MEMORY = {
     "summarized_count": 0,
 }
 
+CURRENT_TURN_CONTEXT: Dict[str, str] = {
+    "user_prompt": "",
+    "memory_summary": "",
+    "web_docs_fetched": "",
+}
+
+TURN_EXECUTED_SIGNATURES: Set[str] = set()
+
 # ==========================================
-# 3. FUNÇÕES SINTÁTICAS E FERRAMENTAS `@tool`
+# 3. FUNÇÕES SINTÁTICAS, VALIDAÇÃO AST E TOOLS `@tool`
 # ==========================================
 def sanitize_text_single_newline(raw_text: str) -> str:
     if not raw_text:
@@ -105,10 +119,51 @@ def sanitize_raw_tavily_snippet(raw_text: str, max_chars: int = 450) -> str:
 
 def strip_outer_markdown_fences(code_text: str) -> str:
     stripped = code_text.strip()
+    blocks = re.findall(r"```(?:[a-zA-Z0-9_+-]*)\n(.*?)```", stripped, flags=re.DOTALL)
+    if blocks:
+        return max(blocks, key=lambda b: len(b.strip())).strip()
     match = re.match(r"^```[a-zA-Z0-9_+-]*\n(.*?)\n```$", stripped, flags=re.DOTALL)
     if match:
-        return match.group(1)
-    return code_text
+        return match.group(1).strip()
+    return stripped
+
+
+def is_code_broken_or_incomplete(filename: str, code_text: str) -> bool:
+    cleaned = code_text.strip()
+    if not cleaned or len(cleaned) < 40:
+        return True
+    if re.search(r"=\s*\.\.\.|^\s*\.\.\.\s*$", cleaned, flags=re.MULTILINE):
+        return True
+    if filename.endswith(".py"):
+        try:
+            ast.parse(cleaned)
+        except SyntaxError as syn_err:
+            print(f"[Validador AST Python] Erro sintático no rascunho da tool: {syn_err}")
+            return True
+    return False
+
+
+def synthesize_clean_file_code_via_invoke(filename: str) -> str:
+    user_req = CURRENT_TURN_CONTEXT.get("user_prompt", "")
+    mem_sum = CURRENT_TURN_CONTEXT.get("memory_summary", "")
+    web_docs = CURRENT_TURN_CONTEXT.get("web_docs_fetched", "")
+
+    web_block = f"- **Verified Web Documentation Fetched in This Turn:**\n{web_docs}\n" if web_docs else ""
+    code_gen_prompt = (
+        f"# TASK: GENERATE COMPLETE PRODUCTION SOURCE CODE FOR FILE '{filename}'\n"
+        f"- **Prior Session Context:** {mem_sum if mem_sum else 'None'}\n"
+        f"{web_block}"
+        f"- **User Requirements:** {user_req}\n"
+        "# STRICT CODE OUTPUT RULES\n"
+        "- Output ONLY a single Markdown code block containing the complete, runnable, syntax-checked source code.\n"
+        "- Use exact, verified library imports and methods (from Verified Web Documentation if present).\n"
+        "- Do NOT include any conversational prose before or after the code block."
+    )
+    print(f"[Code Synthesizer] Gerando código completo via .invoke() livre para './sandbox/{filename}'...")
+    resp = main_llm.invoke([HumanMessage(content=code_gen_prompt)])
+    raw_content = resp.content if hasattr(resp, "content") else str(resp)
+    raw_content = re.sub(r"<think>.*?</think>", "", raw_content, flags=re.DOTALL).strip()
+    return strip_outer_markdown_fences(raw_content)
 
 
 class TavilySearchInput(BaseModel):
@@ -116,7 +171,7 @@ class TavilySearchInput(BaseModel):
     query: str = Field(
         description=(
             "Concise English search query (3 to 6 keywords) containing the exact library, "
-            "framework, and method name (e.g., 'FastAPI lifespan async context manager docs')."
+            "framework, and method name (e.g., 'geopy distance geodesic kilometers python docs')."
         )
     )
 
@@ -125,38 +180,43 @@ class SandboxFileToolInput(BaseModel):
     """Input schema for reading and writing files inside the local sandbox directory."""
     operacao: Literal["read_file", "write_file"] = Field(
         description=(
-            "Select the exact file system action: "
-            "'read_file' to load and inspect an existing file from ./sandbox/, or "
-            "'write_file' to create or overwrite a file in ./sandbox/."
+            "Action to perform: "
+            "Use 'write_file' whenever the user asks to save, create, store, or write a script/file in the sandbox. "
+            "Use 'read_file' whenever the user asks to read, open, or inspect an existing file in the sandbox."
         )
     )
     nome_arquivo: str = Field(
         description=(
-            "Exact filename with extension to read or write inside ./sandbox/ "
-            "(e.g., 'script.py', 'Main.kt', 'pipeline.sql'). Do not include folder paths."
+            "Target filename with extension inside ./sandbox/ (e.g., 'distance_calculator.py', 'script.py', 'Main.kt'). "
+            "If the user asks to save a file in the sandbox without naming it, invent a clear snake_case filename."
         )
     )
     conteudo: str = Field(
         default="",
         description=(
-            "MANDATORY when operacao='write_file': provide the FINAL, COMPLETE, production-ready "
-            "source code to be saved on disk. Must include all required imports, strict type hints, "
-            "clean modular functions/classes, error handling, and an entry point if applicable. "
-            "Do NOT pass a simplified stub or placeholder here—write the exact same high-quality "
-            "code that you will present to the user, without outer ``` markdown fences. "
-            "Pass an empty string '' ONLY when operacao='read_file'."
+            "When operacao='write_file': provide the complete, runnable source code to save into the file "
+            "(with all imports, functions, and proper indentation, without ``` fences). "
+            "When operacao='read_file': pass an empty string ''."
         ),
     )
 
 
-@tool("tavily_web_search", args_schema=TavilySearchInput, return_direct=True)
+@tool("tavily_web_search", args_schema=TavilySearchInput, return_direct=False)
 def tavily_web_search(query: str) -> str:
     """
-    Search external web documentation ONLY when the user asks about newly released APIs,
-    version-specific deprecations, or external libraries requiring up-to-date docs.
-    Do NOT call this tool for standard Python, SQL, or classic framework tasks.
+    Search external web documentation for libraries, APIs, methods, or version deprecations.
+    Can be chained BEFORE `sandbox_file_manager` when you need to verify library imports/methods
+    before writing a file to disk.
     """
     clean_query = sanitize_text_single_newline(query)
+    sig = f"tavily:{clean_query.lower()}"
+    if sig in TURN_EXECUTED_SIGNATURES:
+        return (
+            "ALREADY_SEARCHED: You already executed this web search in this turn. "
+            "Proceed to the next required tool (such as `sandbox_file_manager`) or finish with 'DONE'."
+        )
+    TURN_EXECUTED_SIGNATURES.add(sig)
+
     print(f"[Main Tool Agent] Acionou tavily_web_search: '{clean_query}'")
 
     if tavily_client is None:
@@ -181,10 +241,19 @@ def tavily_web_search(query: str) -> str:
     except Exception as exc:
         print(f"[Tavily API Error]: {exc}")
 
-    return "\n".join(snippets) if snippets else "No relevant external web documentation found."
+    if not snippets:
+        return "No relevant external web documentation found."
+
+    joined_docs = "\n".join(snippets)
+    CURRENT_TURN_CONTEXT["web_docs_fetched"] = joined_docs
+    return (
+        f"WEB_SEARCH_SUCCESS for '{clean_query}':\n{joined_docs}\n"
+        "EVALUATION HINT: If the user also requested saving or reading a file in the sandbox, "
+        "call `sandbox_file_manager` now using these verified facts; otherwise reply 'DONE'."
+    )
 
 
-@tool("sandbox_file_manager", args_schema=SandboxFileToolInput, return_direct=True)
+@tool("sandbox_file_manager", args_schema=SandboxFileToolInput, return_direct=False)
 def sandbox_file_manager(
     operacao: Literal["read_file", "write_file"],
     nome_arquivo: str,
@@ -192,18 +261,22 @@ def sandbox_file_manager(
 ) -> str:
     """
     Read or write files inside the local './sandbox/' directory.
-    Always call this tool when the user asks to read, inspect, create, save, or write a file
-    (such as 'script.py', 'Main.kt', etc.). When operacao='write_file', pass the complete,
-    production-ready code inside 'conteudo' so the file on disk matches your final answer.
+    MUST be called whenever the user explicitly asks to save, write, create, or read a file in the sandbox.
+    Do NOT call this tool if the user did not ask to save or read a file.
     """
-    safe_name = os.path.basename(nome_arquivo.strip())
-    if not safe_name:
-        return "FILE_TOOL_ERROR: Invalid 'nome_arquivo' (empty filename)."
+    safe_name = os.path.basename(nome_arquivo.strip()) or "generated_script.py"
+    sig = f"file:{operacao}:{safe_name}"
+    if sig in TURN_EXECUTED_SIGNATURES:
+        return (
+            f"ALREADY_EXECUTED: `{operacao}` on `./sandbox/{safe_name}` was already completed in this turn. "
+            "Do NOT call `sandbox_file_manager` again; reply 'DONE' to finish tool execution."
+        )
+    TURN_EXECUTED_SIGNATURES.add(sig)
 
     target_path = SANDBOX_DIR / safe_name
     print(
         f"[Main Tool Agent] sandbox_file_manager: operacao='{operacao}' | "
-        f"nome_arquivo='{safe_name}' | len(conteudo)={len(conteudo)} chars"
+        f"nome_arquivo='{safe_name}' | len(conteudo_tool)={len(conteudo)} chars"
     )
 
     if operacao == "read_file":
@@ -213,27 +286,27 @@ def sandbox_file_manager(
             file_text = target_path.read_text(encoding="utf-8")
             return (
                 f"FILE_READ_SUCCESS: Full content of './sandbox/{safe_name}' ({len(file_text)} chars):\n"
-                f"```\n{file_text}\n```"
+                f"```\n{file_text}\n```\n"
+                "EVALUATION HINT: File read complete. If no other tool is needed, reply 'DONE'."
             )
         except Exception as exc:
             return f"FILE_TOOL_ERROR: Failed to read '{safe_name}': {exc}"
 
     if operacao == "write_file":
-        cleaned_content = strip_outer_markdown_fences(conteudo).strip()
-        if not cleaned_content:
-            return (
-                f"FILE_WRITE_EMPTY_CONTENT_WARNING: Tool called for './sandbox/{safe_name}', "
-                "but 'conteudo' was empty (0 bytes)."
-            )
+        cleaned_content = strip_outer_markdown_fences(conteudo)
+        if is_code_broken_or_incomplete(safe_name, cleaned_content):
+            cleaned_content = synthesize_clean_file_code_via_invoke(safe_name)
+
         try:
             target_path.write_text(cleaned_content + "\n", encoding="utf-8")
             size_bytes = len((cleaned_content + "\n").encode("utf-8"))
             line_count = len(cleaned_content.splitlines())
             return (
-                f"FILE_WRITE_SUCCESS: File './sandbox/{safe_name}' has been created "
-                f"({size_bytes} bytes, {line_count} lines) with the exact content below.\n"
-                "Present this exact code and explain it clearly to the user:\n"
-                f"```\n{cleaned_content}\n```"
+                f"FILE_WRITE_SUCCESS: File './sandbox/{safe_name}' has been saved to disk "
+                f"({size_bytes} bytes, {line_count} lines).\n"
+                f"SAVED_FILENAME: ./sandbox/{safe_name}\n"
+                f"SAVED_CODE_REFERENCE:\n```\n{cleaned_content}\n```\n"
+                "EVALUATION HINT: The file is saved on disk. Do NOT call `sandbox_file_manager` again; reply 'DONE'."
             )
         except Exception as exc:
             return f"FILE_TOOL_ERROR: Failed to write '{safe_name}': {exc}"
@@ -305,21 +378,35 @@ def assemble_final_prompt(
             f"{sanitize_text_single_newline(memoria)}"
         )
 
-    if dados_web and dados_web not in (
+    has_tool_data = dados_web and dados_web not in (
         "Nenhuma busca web solicitada.",
         "No relevant external web documentation found.",
-    ):
+    )
+    is_file_write_turn = bool(has_tool_data and "FILE_WRITE_SUCCESS:" in dados_web)
+
+    if has_tool_data:
         blocks.append(
-            "# TOOL EXECUTION RESULTS (VERIFIED SANDBOX FILE SYSTEM / WEB SEARCH STATE)\n"
-            "IMPORTANT: If `FILE_WRITE_SUCCESS` appears below, keep your explanation and code block "
-            "consistent with the saved file `./sandbox/<filename>`.\n"
+            "# TOOL EXECUTION RESULTS (APPENDED BY TOOL NAME - USE TO GROUND YOUR ANSWER)\n"
             f"{dados_web.strip()}"
         )
 
-    blocks.append(
-        "# CURRENT USER REQUEST (YOUR ACTIVE REQUEST TO BE ANSWERED AND FOCUSED FOR THE USER)\n"
-        f"{prompt_usuario}"
-    )
+    if is_file_write_turn:
+        blocks.append(
+            "# CURRENT USER REQUEST (POST-FILE-WRITE EXPLANATION & EXECUTION GUIDE MODE)\n"
+            f"Original Request: {prompt_usuario}\n"
+            "# MANDATORY RESPONSE INSTRUCTIONS FOR SAVED FILE\n"
+            "- The complete source code has ALREADY been saved to `./sandbox/` (see `SAVED_FILENAME` and `SAVED_CODE_REFERENCE` above).\n"
+            "- Do NOT rewrite or repeat the full source code block in the chat.\n"
+            "- Instead, structure your response clearly with:\n"
+            "  1. **Saved File Confirmation & Architecture:** Confirm the exact file path saved in `./sandbox/` and explain how the implemented code works (libraries, functions, formulas, and logic).\n"
+            "  2. **How to Run & Dependencies:** Show the exact terminal commands to install any required packages (e.g., `pip install ...`) and execute the saved script.\n"
+            "  3. **Next Possibilities & Extensions:** Suggest 2 to 3 practical improvements or features the user can add next."
+        )
+    else:
+        blocks.append(
+            "# CURRENT USER REQUEST (YOUR ACTIVE REQUEST TO BE ANSWERED AND FOCUSED FOR THE USER)\n"
+            f"{prompt_usuario}"
+        )
 
     return [HumanMessage(content="\n".join(blocks))]
 
@@ -355,20 +442,24 @@ def memory_and_input_prep_node(state: AgentState):
         if new_to_summarize:
             history_text = "\n".join(
                 [
-                    f"- {'Developer' if isinstance(m, HumanMessage) else 'Assistant'}: "
-                    f"{sanitize_text_single_newline(m.content)[:400]}"
+                    f"### {'Developer' if isinstance(m, HumanMessage) else 'Assistant'} Turn:\n"
+                    f"{sanitize_text_single_newline(m.content)[:1800]}"
                     for m in new_to_summarize
                 ]
             )
 
             prompt_memoria = (
-                "# PREVIOUS SESSION SUMMARY\n"
-                f"{current_summary if current_summary else 'None'}\n"
-                "# NEW DIALOGUE LOGS TO INTEGRATE IN THIRD PERSON\n"
+                "# PREVIOUS TECHNICAL SESSION MEMORY\n"
+                f"{current_summary if current_summary else 'None (Start of session).'}\n"
+                "# NEW DIALOGUE TURNS TO INTEGRATE\n"
                 f"{history_text}\n"
-                "# INSTRUCTION\n"
-                "Return ONLY the updated third-person technical summary (max 3 bullet points) "
-                "preserving all active constraints, target filenames, versions, and forbidden libraries."
+                "# MEMORY SYNTHESIS INSTRUCTIONS (THIRD-PERSON TECHNICAL LOG)\n"
+                "Write a comprehensive, accurate third-person technical memory summary that merges the previous "
+                "memory with the new turns. Do NOT be vague—capture concrete technical details using these 4 bullets:\n"
+                "- **Topic & User Goal:** What the developer is discussing and trying to build or solve.\n"
+                "- **Developed Code & Sandbox Files:** Specific scripts/files created or read (e.g. `./sandbox/km_calculator_address.py`), functions implemented, and logic built so far.\n"
+                "- **Chosen Stack, Libraries & Constraints:** Exact libraries/APIs chosen (e.g. `geopy`, `Nominatim`, `geodesic`), parameters agreed upon, and any forbidden packages or strict rules.\n"
+                "- **Current State for Future Turns:** What was just completed and any pending context needed for follow-up questions."
             )
 
             try:
@@ -387,7 +478,7 @@ def memory_and_input_prep_node(state: AgentState):
     prior_buffer = "\n".join(
         [
             f"- {'Developer' if isinstance(m, HumanMessage) else 'Assistant'}: "
-            f"{sanitize_text_single_newline(m.content)[:300]}"
+            f"{sanitize_text_single_newline(m.content)[:600]}"
             for m in active_messages[:-1]
         ]
     )
@@ -407,36 +498,54 @@ def memory_and_input_prep_node(state: AgentState):
 
 def tool_agent_search_node(state: AgentState):
     clean_prompt = state["clean_user_prompt"]
+    CURRENT_TURN_CONTEXT["user_prompt"] = clean_prompt
+    CURRENT_TURN_CONTEXT["memory_summary"] = state["short_term_memory"]
+    CURRENT_TURN_CONTEXT["web_docs_fetched"] = ""
+    TURN_EXECUTED_SIGNATURES.clear()
+
     existing_files = [p.name for p in sorted(SANDBOX_DIR.iterdir()) if p.is_file()]
     files_str = ", ".join(existing_files) if existing_files else "None"
 
     agent_input = (
-        "Evaluate the developer request below.\n"
+        "Analyze the developer request below and execute the required tool(s). You may chain multiple tools if needed. /no_think\n"
         f"- **Files currently in ./sandbox/:** {files_str}\n"
         f"- **Prior Session Context:** {state['short_term_memory']}\n"
-        "# TOOL EXECUTION & PARAMETER QUALITY RULES\n"
-        "1. If the user asks to READ an existing file from `./sandbox/`, call `sandbox_file_manager` "
-        "with `operacao='read_file'`, `nome_arquivo='<filename>'`, and `conteudo=''`.\n"
-        "2. If the user asks to CREATE, SAVE, or WRITE a file (e.g. 'script.py', 'Main.kt'), "
-        "call `sandbox_file_manager` with `operacao='write_file'`, `nome_arquivo='<filename>'`, and "
-        "put the COMPLETE, well-structured, best-practice code inside `conteudo` (including imports, "
-        "type hints, and clean functions, respecting all session constraints).\n"
-        "3. If the user asks about newly released external APIs or deprecations, call `tavily_web_search`.\n"
-        "4. If no file operation and no external web search are needed, do NOT call any tool and reply only 'NO_TOOL'.\n"
+        "# MULTI-TOOL DECISION & CHAINING MATRIX\n"
+        "1. **WEB SEARCH (`tavily_web_search`):**\n"
+        "   - Call if you need to verify external library imports/methods (e.g. exact `geopy.distance` classes, recent FastAPI/PySpark APIs) or up-to-date documentation.\n"
+        "   - After receiving the search result, evaluate if you also need to call `sandbox_file_manager`.\n"
+        "2. **FILE WRITE (`sandbox_file_manager` with `operacao='write_file'`):**\n"
+        "   - MUST CALL if the user asks to save, write, create, or store a file/script in the sandbox.\n"
+        "   - If the user did not provide a filename, invent a descriptive snake_case filename.\n"
+        "3. **FILE READ (`sandbox_file_manager` with `operacao='read_file'`):**\n"
+        "   - MUST CALL if the user asks to read, open, inspect, or modify an existing file from `./sandbox/`.\n"
+        "4. **STOPPING CONDITION:**\n"
+        "   - If no tools are needed (or once all needed tools have returned their results), do NOT call any more tools and reply only `'DONE'`.\n"
         f"# DEVELOPER REQUEST\n{clean_prompt}"
     )
 
     web_text = "Nenhuma busca web solicitada."
     try:
-        result = main_tool_agent.invoke({"messages": [HumanMessage(content=agent_input)]})
+        result = main_tool_agent.invoke(
+            {"messages": [HumanMessage(content=agent_input)]},
+            config={"recursion_limit": 6},
+        )
         messages: List[BaseMessage] = result.get("messages", [])
-        tool_outputs: List[str] = []
+        appended_tool_outputs: List[str] = []
         for msg in messages:
             if isinstance(msg, ToolMessage) and msg.content:
-                if "No relevant external web documentation found" not in str(msg.content):
-                    tool_outputs.append(str(msg.content))
-        if tool_outputs:
-            web_text = "\n".join(tool_outputs)
+                content_str = str(msg.content)
+                if (
+                    "No relevant external web documentation found" not in content_str
+                    and not content_str.startswith("ALREADY_")
+                ):
+                    tool_name = getattr(msg, "name", None) or "tool"
+                    step_num = len(appended_tool_outputs) + 1
+                    appended_tool_outputs.append(
+                        f"## [TOOL #{step_num} RESULT — `{tool_name}`]\n{content_str}"
+                    )
+        if appended_tool_outputs:
+            web_text = "\n".join(appended_tool_outputs)
     except Exception as exc:
         print(f"[Aviso Tool Agent]: {exc}")
 
