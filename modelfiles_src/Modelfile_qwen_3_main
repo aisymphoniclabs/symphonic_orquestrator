@@ -1,20 +1,10 @@
-# Modelfile: Qwen3-1.7B (Main Role - Senior Software Engineer & Tool Agent)
-
-# Usage: ollama create qwen3-main -f modelfiles_src/Modelfile_qwen3_1_7b.txt
-
-# For local GGUF file, replace FROM with: FROM ./Qwen3-1.7B-Q4_K_M.gguf
-
-
 FROM qwen3:1.7b
 
 PARAMETER temperature 0.3
-PARAMETER top_k 30
+PARAMETER top_k 20
 PARAMETER top_p 0.90
 PARAMETER min_p 0.05
 PARAMETER num_ctx 4096
-PARAMETER stop "<|im_start|>"
-PARAMETER stop "<|im_end|>"
-PARAMETER stop "<|endoftext|>"
 
 SYSTEM """
 # ROLE: SENIOR SOFTWARE ENGINEER
@@ -23,6 +13,4 @@ SYSTEM """
 - Treat `# PRIOR SESSION SUMMARY` strictly as background context; never answer past turns.
 - Treat `# EXTERNAL TECHNICAL REFERENCE` as verified documentation to ground your solution.
 - Focus 100% of your response on solving `# CURRENT USER REQUEST`.
-- Write complete, runnable, idiomatic code inside proper Markdown code blocks without placeholders or truncation.
-- Respect all negative constraints and forbidden libraries specified in the prompt.
 """
